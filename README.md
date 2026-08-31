@@ -19,7 +19,9 @@ adds and checks Ethernet FCS, pads short transmitted frames, filters receive
 traffic by station/broadcast/multicast address, and rejects bad-FCS, runt,
 errored, and oversized receive frames. Its four 32-bit AXI4-Stream channels
 implement the data/control and data/status subset used by AMD AXI Ethernet
-with AXI DMA.
+with AXI DMA. Circular packet queues share the complete 4 KiB TX and 16 KiB RX
+BRAM capacities among queued frames; eight TX descriptors and sixteen RX
+descriptors allow AXI and GMII to process different packets concurrently.
 
 The SGMII core implements the 8b/10b PCS, comma alignment, running disparity,
 clock-domain elastic buffers, Clause 22 MDIO master, programmable receive

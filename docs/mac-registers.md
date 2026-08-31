@@ -32,8 +32,25 @@ Ethernet features must not assume those features are present.
 | `0x0704` | UAW1 | Station address high 16 bits |
 | `0x0708` | FMI | Bit 31 enables promiscuous receive mode |
 
+Reads of GMII-domain statistics use a request/acknowledge snapshot handshake.
+The AXI read response is delayed by several clock cycles while the selected
+counter is captured and held stable across the clock-domain crossing. The
+AXI4-Lite master must therefore wait for `RVALID` rather than assuming a fixed
+read latency. The TX-oversized counter, which already resides in the AXI clock
+domain, does not require a snapshot.
+
 The receive path accepts the programmed station address, broadcast, and all
 multicast destinations. It validates destination, length, GMII error, and FCS
-before producing AXI4-Stream data or status. The transmit path buffers the
-entire packet before emitting preamble, payload, padding, FCS, and interpacket
-gap on GMII.
+before committing a packet descriptor. The receive data and status streams may
+drain independently; their shared ring allocation is reclaimed after both have
+completed. The transmit path commits a descriptor only after the entire AXI
+packet reaches `TLAST`, then emits preamble, payload, padding, FCS, and
+interpacket gap on GMII.
+
+The 4 KiB TX and 16 KiB RX memories are circular word-addressed buffers rather
+than single-packet slots. They can hold multiple variable-length packets up to
+the available byte capacity. Separate descriptor rings hold up to eight TX
+packets and sixteen RX packets. RX admission reserves enough free ring space
+for a maximum-size frame before accepting its SFD; a valid frame is counted as
+an RX overflow if either the descriptor ring or that reserved data capacity is
+unavailable.

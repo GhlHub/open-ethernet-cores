@@ -83,6 +83,14 @@ module open_eth_mac_1g (
 
 localparam integer TX_BYTES = 4096;
 localparam integer RX_BYTES = 16384;
+localparam integer TX_WORDS = TX_BYTES / 4;
+localparam integer RX_WORDS = RX_BYTES / 4;
+localparam integer TX_ADDR_BITS = 10;
+localparam integer RX_ADDR_BITS = 12;
+localparam integer TX_DESC_DEPTH = 8;
+localparam integer RX_DESC_DEPTH = 16;
+localparam integer TX_DESC_BITS = 3;
+localparam integer RX_DESC_BITS = 4;
 localparam [31:0] CRC_RESIDUE = 32'hdebb20e3;
 localparam [31:0] CORE_ID = 32'h4f4d4143; // "OMAC"
 
@@ -95,6 +103,48 @@ function automatic [31:0] crc32_byte(input [31:0] crc, input [7:0] data);
             else c = c >> 1;
         end
         crc32_byte = c;
+    end
+endfunction
+
+function automatic [TX_ADDR_BITS:0] tx_gray_to_binary(
+    input [TX_ADDR_BITS:0] gray);
+    integer i;
+    begin
+        tx_gray_to_binary[TX_ADDR_BITS] = gray[TX_ADDR_BITS];
+        for (i = TX_ADDR_BITS - 1; i >= 0; i = i - 1)
+            tx_gray_to_binary[i] = tx_gray_to_binary[i + 1] ^ gray[i];
+    end
+endfunction
+
+function automatic [RX_ADDR_BITS:0] rx_gray_to_binary(
+    input [RX_ADDR_BITS:0] gray);
+    integer i;
+    begin
+        rx_gray_to_binary[RX_ADDR_BITS] = gray[RX_ADDR_BITS];
+        for (i = RX_ADDR_BITS - 1; i >= 0; i = i - 1)
+            rx_gray_to_binary[i] = rx_gray_to_binary[i + 1] ^ gray[i];
+    end
+endfunction
+
+function automatic [TX_DESC_BITS:0] tx_desc_gray_to_binary(
+    input [TX_DESC_BITS:0] gray);
+    integer i;
+    begin
+        tx_desc_gray_to_binary[TX_DESC_BITS] = gray[TX_DESC_BITS];
+        for (i = TX_DESC_BITS - 1; i >= 0; i = i - 1)
+            tx_desc_gray_to_binary[i] =
+                tx_desc_gray_to_binary[i + 1] ^ gray[i];
+    end
+endfunction
+
+function automatic [RX_DESC_BITS:0] rx_desc_gray_to_binary(
+    input [RX_DESC_BITS:0] gray);
+    integer i;
+    begin
+        rx_desc_gray_to_binary[RX_DESC_BITS] = gray[RX_DESC_BITS];
+        for (i = RX_DESC_BITS - 1; i >= 0; i = i - 1)
+            rx_desc_gray_to_binary[i] =
+                rx_desc_gray_to_binary[i + 1] ^ gray[i];
     end
 endfunction
 
@@ -111,6 +161,10 @@ reg aw_hold_valid, w_hold_valid;
 reg [17:0] aw_hold;
 reg [31:0] w_hold;
 reg [3:0] wstrb_hold;
+reg snapshot_request, snapshot_ack;
+(* ASYNC_REG = "TRUE" *) reg [1:0] snapshot_request_sync, snapshot_ack_sync;
+reg snapshot_read_pending;
+reg [3:0] snapshot_select;
 wire write_fire = aw_hold_valid && w_hold_valid && !s_axi_bvalid;
 wire [31:0] write_mask = {{8{wstrb_hold[3]}}, {8{wstrb_hold[2]}},
                           {8{wstrb_hold[1]}}, {8{wstrb_hold[0]}}};
@@ -118,26 +172,48 @@ wire [31:0] write_merged_raf = (reg_raf & ~write_mask) | (w_hold & write_mask);
 assign s_axi_awready = s_axi_lite_resetn && !aw_hold_valid && !s_axi_bvalid;
 assign s_axi_wready = s_axi_lite_resetn && !w_hold_valid && !s_axi_bvalid;
 assign s_axi_bresp = 2'b00;
-assign s_axi_arready = s_axi_lite_resetn && !s_axi_rvalid;
+assign s_axi_arready = s_axi_lite_resetn && !s_axi_rvalid &&
+                       !snapshot_read_pending && !snapshot_ack_sync[1];
 assign s_axi_rresp = 2'b00;
 assign interrupt = 1'b0;
 assign mac_irq = |(irq_status & reg_ie);
 
-// Event counters live in the GMII domain and are sampled by AXI-Lite. They are
-// diagnostic counters; coherent 64-bit snapshots are not required by software.
+// Event counters live in the GMII domain. AXI-Lite requests an atomic bundled
+// snapshot when software reads a GMII-domain statistic. The source holds the
+// snapshot stable until the request is released after the read response.
 reg [31:0] rx_byte_count, tx_byte_count, rx_frame_count, rx_fcs_error_count;
 reg [31:0] rx_broadcast_count, rx_multicast_count, tx_frame_count;
 reg [31:0] rx_filter_drop_count, rx_overflow_count;
 reg [31:0] tx_oversize_count_axis;
-(* ASYNC_REG = "TRUE" *) reg [31:0] rx_byte_count_meta, rx_byte_count_sync;
-(* ASYNC_REG = "TRUE" *) reg [31:0] tx_byte_count_meta, tx_byte_count_sync;
-(* ASYNC_REG = "TRUE" *) reg [31:0] rx_frame_count_meta, rx_frame_count_sync;
-(* ASYNC_REG = "TRUE" *) reg [31:0] rx_fcs_error_count_meta, rx_fcs_error_count_sync;
-(* ASYNC_REG = "TRUE" *) reg [31:0] rx_broadcast_count_meta, rx_broadcast_count_sync;
-(* ASYNC_REG = "TRUE" *) reg [31:0] rx_multicast_count_meta, rx_multicast_count_sync;
-(* ASYNC_REG = "TRUE" *) reg [31:0] tx_frame_count_meta, tx_frame_count_sync;
-(* ASYNC_REG = "TRUE" *) reg [31:0] rx_filter_drop_meta, rx_filter_drop_sync;
-(* ASYNC_REG = "TRUE" *) reg [31:0] rx_overflow_meta, rx_overflow_sync;
+reg [31:0] snapshot_value;
+
+function automatic is_snapshot_counter_address(input [17:0] addr);
+    begin
+        case (addr)
+          18'h00200, 18'h00208, 18'h00250, 18'h00290, 18'h00298,
+          18'h002a0, 18'h002a8, 18'h002d8, 18'h3ff00, 18'h3ff04:
+            is_snapshot_counter_address = 1'b1;
+          default: is_snapshot_counter_address = 1'b0;
+        endcase
+    end
+endfunction
+
+function automatic [3:0] snapshot_counter_select(input [17:0] addr);
+    begin
+        case (addr)
+          18'h00200: snapshot_counter_select = 0;
+          18'h00208: snapshot_counter_select = 1;
+          18'h00250, 18'h3ff04: snapshot_counter_select = 2;
+          18'h00290: snapshot_counter_select = 3;
+          18'h00298: snapshot_counter_select = 4;
+          18'h002a0: snapshot_counter_select = 5;
+          18'h002a8: snapshot_counter_select = 6;
+          18'h002d8: snapshot_counter_select = 7;
+          18'h3ff00: snapshot_counter_select = 8;
+          default: snapshot_counter_select = 0;
+        endcase
+    end
+endfunction
 
 task automatic write_reg(input [17:0] addr, input [31:0] value, input [31:0] mask);
     begin
@@ -168,25 +244,10 @@ always @(posedge s_axi_lite_clk) begin
         reg_uaw0 <= 0; reg_uaw1 <= 0; reg_fmi <= 0; irq_status <= 32'hc0;
         aw_hold_valid <= 0; w_hold_valid <= 0; s_axi_bvalid <= 0;
         s_axi_rvalid <= 0; s_axi_rdata <= 0;
-        rx_byte_count_meta <= 0; rx_byte_count_sync <= 0;
-        tx_byte_count_meta <= 0; tx_byte_count_sync <= 0;
-        rx_frame_count_meta <= 0; rx_frame_count_sync <= 0;
-        rx_fcs_error_count_meta <= 0; rx_fcs_error_count_sync <= 0;
-        rx_broadcast_count_meta <= 0; rx_broadcast_count_sync <= 0;
-        rx_multicast_count_meta <= 0; rx_multicast_count_sync <= 0;
-        tx_frame_count_meta <= 0; tx_frame_count_sync <= 0;
-        rx_filter_drop_meta <= 0; rx_filter_drop_sync <= 0;
-        rx_overflow_meta <= 0; rx_overflow_sync <= 0;
+        snapshot_request <= 0; snapshot_ack_sync <= 0;
+        snapshot_read_pending <= 0; snapshot_select <= 0;
     end else begin
-        rx_byte_count_meta <= rx_byte_count; rx_byte_count_sync <= rx_byte_count_meta;
-        tx_byte_count_meta <= tx_byte_count; tx_byte_count_sync <= tx_byte_count_meta;
-        rx_frame_count_meta <= rx_frame_count; rx_frame_count_sync <= rx_frame_count_meta;
-        rx_fcs_error_count_meta <= rx_fcs_error_count; rx_fcs_error_count_sync <= rx_fcs_error_count_meta;
-        rx_broadcast_count_meta <= rx_broadcast_count; rx_broadcast_count_sync <= rx_broadcast_count_meta;
-        rx_multicast_count_meta <= rx_multicast_count; rx_multicast_count_sync <= rx_multicast_count_meta;
-        tx_frame_count_meta <= tx_frame_count; tx_frame_count_sync <= tx_frame_count_meta;
-        rx_filter_drop_meta <= rx_filter_drop_count; rx_filter_drop_sync <= rx_filter_drop_meta;
-        rx_overflow_meta <= rx_overflow_count; rx_overflow_sync <= rx_overflow_meta;
+        snapshot_ack_sync <= {snapshot_ack_sync[0], snapshot_ack};
         if (s_axi_awready && s_axi_awvalid) begin aw_hold <= s_axi_awaddr; aw_hold_valid <= 1; end
         if (s_axi_wready && s_axi_wvalid) begin w_hold <= s_axi_wdata; wstrb_hold <= s_axi_wstrb; w_hold_valid <= 1; end
         if (write_fire) begin
@@ -199,21 +260,18 @@ always @(posedge s_axi_lite_clk) begin
         end
         if (s_axi_bvalid && s_axi_bready) s_axi_bvalid <= 0;
         if (s_axi_arready && s_axi_arvalid) begin
-            s_axi_rvalid <= 1;
-            case (s_axi_araddr)
+            if (is_snapshot_counter_address(s_axi_araddr)) begin
+                snapshot_request <= 1;
+                snapshot_read_pending <= 1;
+                snapshot_select <= snapshot_counter_select(s_axi_araddr);
+            end else begin
+              s_axi_rvalid <= 1;
+              case (s_axi_araddr)
               18'h00000: s_axi_rdata <= reg_raf;
               18'h0000c: s_axi_rdata <= irq_status | 32'hc0;
               18'h00010: s_axi_rdata <= irq_status & reg_ie;
               18'h00014: s_axi_rdata <= reg_ie;
-              18'h00200: s_axi_rdata <= rx_byte_count_sync;
-              18'h00208: s_axi_rdata <= tx_byte_count_sync;
-              18'h00250: s_axi_rdata <= rx_overflow_sync;
               18'h00288: s_axi_rdata <= tx_oversize_count_axis;
-              18'h00290: s_axi_rdata <= rx_frame_count_sync;
-              18'h00298: s_axi_rdata <= rx_fcs_error_count_sync;
-              18'h002a0: s_axi_rdata <= rx_broadcast_count_sync;
-              18'h002a8: s_axi_rdata <= rx_multicast_count_sync;
-              18'h002d8: s_axi_rdata <= tx_frame_count_sync;
               18'h00400: s_axi_rdata <= reg_rcw0;
               18'h00404: s_axi_rdata <= reg_rcw1;
               18'h00408: s_axi_rdata <= reg_tc;
@@ -227,61 +285,110 @@ always @(posedge s_axi_lite_clk) begin
               18'h00700: s_axi_rdata <= reg_uaw0;
               18'h00704: s_axi_rdata <= reg_uaw1;
               18'h00708: s_axi_rdata <= reg_fmi;
-              18'h3ff00: s_axi_rdata <= rx_filter_drop_sync;
-              18'h3ff04: s_axi_rdata <= rx_overflow_sync;
               18'h3ff08: s_axi_rdata <= tx_oversize_count_axis;
               default: s_axi_rdata <= 0;
-            endcase
+              endcase
+            end
+        end
+        if (snapshot_read_pending && snapshot_ack_sync[1]) begin
+            s_axi_rdata <= snapshot_value;
+            s_axi_rvalid <= 1;
+            snapshot_read_pending <= 0;
+            snapshot_request <= 0;
         end
         if (s_axi_rvalid && s_axi_rready) s_axi_rvalid <= 0;
     end
 end
 
-// TX AXI stream: accept the six descriptor control words, then buffer one
-// complete packet. No GMII transmission starts until TLAST has committed it.
-reg tx_control_ready, tx_packet_pending, tx_drop;
+// TX AXI stream: packet data and descriptors are independent circular queues.
+// A descriptor becomes visible to GMII only after TLAST commits the complete
+// frame. The uncommitted write pointer can stall behind older queued frames;
+// GMII continues reclaiming those frames while AXI is backpressured.
+reg tx_control_ready, tx_drop;
 reg [2:0] txc_words;
 reg [12:0] tx_wr_count;
-reg [12:0] tx_length_axis;
-reg tx_request_toggle;
-reg tx_request_toggle_gmii_ack;
-(* ASYNC_REG = "TRUE" *) reg [1:0] tx_ack_sync;
+reg [TX_ADDR_BITS:0] tx_data_wr_bin, tx_data_work_bin;
+reg [TX_ADDR_BITS:0] tx_data_rd_bin;
+reg [TX_ADDR_BITS:0] tx_data_rd_gray;
+(* ASYNC_REG = "TRUE" *) reg [TX_ADDR_BITS:0] tx_data_rd_gray_sync1;
+(* ASYNC_REG = "TRUE" *) reg [TX_ADDR_BITS:0] tx_data_rd_gray_sync2;
+reg [TX_DESC_BITS:0] tx_desc_wr_bin, tx_desc_wr_gray;
+reg [TX_DESC_BITS:0] tx_desc_rd_bin, tx_desc_rd_gray;
+(* ASYNC_REG = "TRUE" *) reg [TX_DESC_BITS:0] tx_desc_rd_gray_sync1;
+(* ASYNC_REG = "TRUE" *) reg [TX_DESC_BITS:0] tx_desc_rd_gray_sync2;
+(* ASYNC_REG = "TRUE" *) reg [TX_DESC_BITS:0] tx_desc_wr_gray_sync1;
+(* ASYNC_REG = "TRUE" *) reg [TX_DESC_BITS:0] tx_desc_wr_gray_sync2;
+reg [TX_ADDR_BITS-1:0] tx_desc_start [0:TX_DESC_DEPTH-1];
+reg [12:0] tx_desc_length [0:TX_DESC_DEPTH-1];
+reg [TX_ADDR_BITS:0] tx_frame_words;
 wire [2:0] tx_valid_bytes = s_axis_txd_tkeep[0] + s_axis_txd_tkeep[1] +
                              s_axis_txd_tkeep[2] + s_axis_txd_tkeep[3];
-assign s_axis_txc_tready = axi_txc_arstn && !tx_control_ready && !tx_packet_pending;
-assign s_axis_txd_tready = axi_txd_arstn && tx_control_ready && !tx_packet_pending;
-wire tx_mem_write = s_axis_txd_tvalid && s_axis_txd_tready &&
-                    (tx_wr_count < TX_BYTES);
+wire [TX_ADDR_BITS:0] tx_data_rd_bin_axis =
+    tx_gray_to_binary(tx_data_rd_gray_sync2);
+wire [TX_ADDR_BITS:0] tx_data_used_words =
+    tx_data_work_bin - tx_data_rd_bin_axis;
+wire tx_data_has_space = tx_data_used_words < TX_WORDS;
+wire [TX_DESC_BITS:0] tx_desc_rd_bin_axis =
+    tx_desc_gray_to_binary(tx_desc_rd_gray_sync2);
+wire tx_desc_full = (tx_desc_wr_bin - tx_desc_rd_bin_axis) == TX_DESC_DEPTH;
+assign s_axis_txc_tready = axi_txc_arstn && !tx_control_ready && !tx_desc_full;
+assign s_axis_txd_tready = axi_txd_arstn && tx_control_ready &&
+    (tx_drop || tx_data_has_space || tx_frame_words >= TX_WORDS);
+wire tx_data_handshake = s_axis_txd_tvalid && s_axis_txd_tready;
+wire tx_store_beat = tx_data_handshake && !tx_drop && tx_data_has_space &&
+                     tx_valid_bytes != 0;
+wire tx_mem_write = tx_store_beat;
 
 always @(posedge axis_clk) begin
-    tx_ack_sync <= {tx_ack_sync[0], tx_request_toggle_gmii_ack};
+    tx_data_rd_gray_sync1 <= tx_data_rd_gray;
+    tx_data_rd_gray_sync2 <= tx_data_rd_gray_sync1;
+    tx_desc_rd_gray_sync1 <= tx_desc_rd_gray;
+    tx_desc_rd_gray_sync2 <= tx_desc_rd_gray_sync1;
     if (!axi_txd_arstn || !axi_txc_arstn) begin
-        tx_control_ready <= 0; tx_packet_pending <= 0; tx_drop <= 0;
-        txc_words <= 0; tx_wr_count <= 0; tx_length_axis <= 0;
-        tx_request_toggle <= 0; tx_ack_sync <= 0;
+        tx_control_ready <= 0; tx_drop <= 0;
+        txc_words <= 0; tx_wr_count <= 0; tx_frame_words <= 0;
+        tx_data_wr_bin <= 0; tx_data_work_bin <= 0;
+        tx_data_rd_gray_sync1 <= 0; tx_data_rd_gray_sync2 <= 0;
+        tx_desc_wr_bin <= 0; tx_desc_wr_gray <= 0;
+        tx_desc_rd_gray_sync1 <= 0; tx_desc_rd_gray_sync2 <= 0;
         tx_oversize_count_axis <= 0;
     end else begin
-        if (tx_packet_pending && tx_ack_sync[1] == tx_request_toggle)
-            tx_packet_pending <= 0;
         if (s_axis_txc_tvalid && s_axis_txc_tready) begin
             if (s_axis_txc_tlast || txc_words == 5) begin
-                tx_control_ready <= 1; txc_words <= 0; tx_wr_count <= 0; tx_drop <= 0;
+                tx_control_ready <= 1; txc_words <= 0; tx_wr_count <= 0;
+                tx_frame_words <= 0; tx_data_work_bin <= tx_data_wr_bin;
+                tx_drop <= 0;
             end else txc_words <= txc_words + 1'b1;
         end
-        if (s_axis_txd_tvalid && s_axis_txd_tready) begin
+        if (tx_data_handshake) begin
+            if (tx_store_beat) begin
 `ifndef SYNTHESIS
-            if (tx_wr_count < TX_BYTES)
-                tx_mem[tx_wr_count[11:2]] <= s_axis_txd_tdata;
+                tx_mem[tx_data_work_bin[TX_ADDR_BITS-1:0]] <=
+                    s_axis_txd_tdata;
 `endif
-            if (tx_wr_count + tx_valid_bytes > TX_BYTES) tx_drop <= 1;
-            tx_wr_count <= tx_wr_count + tx_valid_bytes;
+                tx_data_work_bin <= tx_data_work_bin + 1'b1;
+                tx_frame_words <= tx_frame_words + 1'b1;
+            end else if (!tx_drop) begin
+                tx_drop <= 1;
+            end
+            if (tx_wr_count <= TX_BYTES)
+                tx_wr_count <= tx_wr_count + tx_valid_bytes;
             if (s_axis_txd_tlast) begin
                 tx_control_ready <= 0;
-                if (!tx_drop && tx_wr_count + tx_valid_bytes <= TX_BYTES && tx_valid_bytes != 0) begin
-                    tx_length_axis <= tx_wr_count + tx_valid_bytes;
-                    tx_request_toggle <= ~tx_request_toggle;
-                    tx_packet_pending <= 1;
-                end else tx_oversize_count_axis <= tx_oversize_count_axis + 1'b1;
+                if (!tx_drop && tx_store_beat &&
+                    tx_wr_count + tx_valid_bytes <= TX_BYTES) begin
+                    tx_desc_start[tx_desc_wr_bin[TX_DESC_BITS-1:0]] <=
+                        tx_data_wr_bin[TX_ADDR_BITS-1:0];
+                    tx_desc_length[tx_desc_wr_bin[TX_DESC_BITS-1:0]] <=
+                        tx_wr_count + tx_valid_bytes;
+                    tx_data_wr_bin <= tx_data_work_bin + 1'b1;
+                    tx_desc_wr_bin <= tx_desc_wr_bin + 1'b1;
+                    tx_desc_wr_gray <= ((tx_desc_wr_bin + 1'b1) >> 1) ^
+                                       (tx_desc_wr_bin + 1'b1);
+                end else begin
+                    tx_data_work_bin <= tx_data_wr_bin;
+                    tx_oversize_count_axis <= tx_oversize_count_axis + 1'b1;
+                end
             end
         end
     end
@@ -290,16 +397,17 @@ end
 // TX GMII state machine, including preamble/SFD, minimum-frame padding, FCS,
 // and the mandatory 12-byte interpacket gap.
 localparam [3:0] TX_IDLE=0, TX_PREAMBLE=1, TX_DATA=2, TX_PAD=3,
-                 TX_FCS0=4, TX_FCS1=5, TX_FCS2=6, TX_FCS3=7, TX_IFG=8;
+                 TX_FCS0=4, TX_FCS1=5, TX_FCS2=6, TX_FCS3=7, TX_IFG=8,
+                 TX_DISCARD=9, TX_LAUNCH=10;
 reg [3:0] tx_state;
 reg [3:0] tx_phase;
 reg [9:0] tx_rd_addr;
+reg [TX_ADDR_BITS-1:0] tx_start_gmii;
 reg [1:0] tx_rd_lane;
 reg [12:0] tx_length_gmii, tx_data_sent;
 wire [31:0] tx_mem_q;
 wire [7:0] tx_mem_byte = tx_mem_q[tx_rd_lane*8 +: 8];
 reg [31:0] tx_crc, tx_fcs;
-(* ASYNC_REG = "TRUE" *) reg [1:0] tx_request_sync;
 (* ASYNC_REG = "TRUE" *) reg [1:0] tx_enable_sync;
 (* ASYNC_REG = "TRUE" *) reg [1:0] gtx_tx_reset_sync = 2'b00;
 (* ASYNC_REG = "TRUE" *) reg [1:0] gtx_rx_reset_sync = 2'b00;
@@ -315,24 +423,70 @@ always @(posedge gtx_clk) begin
 end
 
 always @(posedge gtx_clk) begin
-    tx_request_sync <= {tx_request_sync[0], tx_request_toggle};
+    snapshot_request_sync <= {snapshot_request_sync[0], snapshot_request};
+    if (!gtx_tx_resetn || !gtx_rx_resetn) begin
+        snapshot_request_sync <= 0; snapshot_ack <= 0;
+        snapshot_value <= 0;
+    end else if (snapshot_request_sync[1] && !snapshot_ack) begin
+        case (snapshot_select)
+          0: snapshot_value <= rx_byte_count;
+          1: snapshot_value <= tx_byte_count;
+          2: snapshot_value <= rx_overflow_count;
+          3: snapshot_value <= rx_frame_count;
+          4: snapshot_value <= rx_fcs_error_count;
+          5: snapshot_value <= rx_broadcast_count;
+          6: snapshot_value <= rx_multicast_count;
+          7: snapshot_value <= tx_frame_count;
+          8: snapshot_value <= rx_filter_drop_count;
+          default: snapshot_value <= 0;
+        endcase
+        snapshot_ack <= 1;
+    end else if (!snapshot_request_sync[1]) begin
+        snapshot_ack <= 0;
+    end
+end
+
+always @(posedge gtx_clk) begin
+    tx_desc_wr_gray_sync1 <= tx_desc_wr_gray;
+    tx_desc_wr_gray_sync2 <= tx_desc_wr_gray_sync1;
     tx_enable_sync <= {tx_enable_sync[0], reg_tc[28]};
     if (!gtx_tx_resetn) begin
         tx_state <= TX_IDLE; gmii_txd <= 0; gmii_tx_en <= 0; gmii_tx_er <= 0;
-        tx_phase <= 0; tx_rd_addr <= 0; tx_rd_lane <= 0; tx_data_sent <= 0; tx_crc <= 32'hffffffff;
-        tx_request_sync <= 0; tx_request_toggle_gmii_ack <= 0; tx_enable_sync <= 0;
+        tx_phase <= 0; tx_rd_addr <= 0; tx_start_gmii <= 0;
+        tx_rd_lane <= 0; tx_data_sent <= 0; tx_crc <= 32'hffffffff;
+        tx_desc_wr_gray_sync1 <= 0; tx_desc_wr_gray_sync2 <= 0;
+        tx_desc_rd_bin <= 0; tx_desc_rd_gray <= 0;
+        tx_data_rd_bin <= 0; tx_data_rd_gray <= 0; tx_enable_sync <= 0;
         tx_byte_count <= 0; tx_frame_count <= 0;
     end else if (clk_en) begin
         gmii_tx_er <= 0;
         case (tx_state)
           TX_IDLE: begin
               gmii_tx_en <= 0; gmii_txd <= 0; tx_rd_addr <= 0; tx_rd_lane <= 0;
-              if (tx_request_sync[1] != tx_request_toggle_gmii_ack) begin
-                  if (tx_enable_sync[1]) begin
-                      tx_length_gmii <= tx_length_axis; tx_phase <= 0;
-                      tx_data_sent <= 0; tx_crc <= 32'hffffffff; tx_state <= TX_PREAMBLE;
-                  end else tx_request_toggle_gmii_ack <= tx_request_sync[1];
+              if (tx_desc_rd_gray != tx_desc_wr_gray_sync2) begin
+                  tx_start_gmii <= tx_desc_start[
+                      tx_desc_rd_bin[TX_DESC_BITS-1:0]];
+                  tx_length_gmii <= tx_desc_length[
+                      tx_desc_rd_bin[TX_DESC_BITS-1:0]];
+                  tx_state <= TX_LAUNCH;
               end
+          end
+          TX_LAUNCH: begin
+              tx_rd_addr <= tx_start_gmii;
+              if (tx_enable_sync[1]) begin
+                  tx_phase <= 0; tx_data_sent <= 0;
+                  tx_crc <= 32'hffffffff; tx_state <= TX_PREAMBLE;
+              end else tx_state <= TX_DISCARD;
+          end
+          TX_DISCARD: begin
+              tx_data_rd_bin <= tx_data_rd_bin + ((tx_length_gmii + 3) >> 2);
+              tx_data_rd_gray <= ((tx_data_rd_bin +
+                  ((tx_length_gmii + 3) >> 2)) >> 1) ^
+                  (tx_data_rd_bin + ((tx_length_gmii + 3) >> 2));
+              tx_desc_rd_bin <= tx_desc_rd_bin + 1'b1;
+              tx_desc_rd_gray <= ((tx_desc_rd_bin + 1'b1) >> 1) ^
+                                 (tx_desc_rd_bin + 1'b1);
+              tx_state <= TX_IDLE;
           end
           TX_PREAMBLE: begin
               gmii_tx_en <= 1; gmii_txd <= (tx_phase == 7) ? 8'hd5 : 8'h55;
@@ -369,7 +523,13 @@ always @(posedge gtx_clk) begin
           TX_FCS3: begin
               gmii_txd <= tx_fcs[31:24]; tx_state <= TX_IFG; tx_phase <= 0;
               tx_frame_count <= tx_frame_count + 1'b1;
-              tx_request_toggle_gmii_ack <= tx_request_sync[1];
+              tx_data_rd_bin <= tx_data_rd_bin + ((tx_length_gmii + 3) >> 2);
+              tx_data_rd_gray <= ((tx_data_rd_bin +
+                  ((tx_length_gmii + 3) >> 2)) >> 1) ^
+                  (tx_data_rd_bin + ((tx_length_gmii + 3) >> 2));
+              tx_desc_rd_bin <= tx_desc_rd_bin + 1'b1;
+              tx_desc_rd_gray <= ((tx_desc_rd_bin + 1'b1) >> 1) ^
+                                 (tx_desc_rd_bin + 1'b1);
           end
           TX_IFG: begin
               gmii_tx_en <= 0; gmii_txd <= 0;
@@ -396,7 +556,7 @@ xpm_memory_sdpram #(
     .USE_MEM_INIT(0), .WAKEUP_TIME("disable_sleep"),
     .WRITE_DATA_WIDTH_A(32), .WRITE_MODE_B("no_change")) tx_packet_buffer (
     .clka(axis_clk), .ena(1'b1), .wea(tx_mem_write),
-    .addra(tx_wr_count[11:2]), .dina(s_axis_txd_tdata),
+    .addra(tx_data_work_bin[TX_ADDR_BITS-1:0]), .dina(s_axis_txd_tdata),
     .injectdbiterra(1'b0), .injectsbiterra(1'b0),
     .clkb(gtx_clk), .enb(1'b1), .addrb(tx_rd_addr), .doutb(tx_mem_q),
     .regceb(1'b1), .rstb(!gtx_tx_resetn), .sleep(1'b0),
@@ -407,13 +567,15 @@ assign tx_mem_q = tx_mem_q_sim;
 always @(posedge gtx_clk) tx_mem_q_sim <= tx_mem[tx_rd_addr];
 `endif
 
-// RX GMII: locate SFD and store the complete frame in the 16 KiB dual-clock
-// RAM. Nothing is exposed to AXI until destination, length, GMII error, and
-// FCS checks have all passed. The 1518-byte DMA limit includes room for a
+// RX GMII: locate SFD and store complete frames in a circular 16 KiB data
+// queue. A descriptor is committed only after destination, length, GMII error,
+// and FCS checks pass. The AXI side can drain an older descriptor while GMII
+// receives following frames. The 1518-byte DMA limit includes room for a
 // VLAN-tagged frame after the four-byte FCS has been stripped.
 localparam [1:0] RX_SEARCH=0, RX_FRAME=1, RX_WAIT=2;
 localparam integer RX_MIN_WIRE_BYTES = 64;
 localparam integer RX_MAX_DMA_BYTES = 1518;
+localparam integer RX_MAX_WIRE_WORDS = (RX_MAX_DMA_BYTES + 7) / 4;
 reg [1:0] rx_state;
 reg [2:0] rx_preamble_count;
 reg [14:0] rx_wire_count;
@@ -422,11 +584,24 @@ reg [31:0] rx_word_accum;
 reg [47:0] rx_destination;
 reg rx_accepted, rx_error_seen, rx_is_broadcast, rx_is_multicast;
 reg [31:0] rx_crc;
-reg [14:0] rx_length_gmii;
-reg [31:0] rx_status_word3;
-reg rx_done_toggle;
-reg rx_ack_toggle_axis;
-(* ASYNC_REG = "TRUE" *) reg [1:0] rx_ack_sync;
+reg rx_store_frame;
+reg [RX_ADDR_BITS-1:0] rx_frame_start_word;
+reg [RX_ADDR_BITS:0] rx_data_wr_bin, rx_data_rd_bin;
+reg [RX_ADDR_BITS:0] rx_data_rd_gray;
+(* ASYNC_REG = "TRUE" *) reg [RX_ADDR_BITS:0] rx_data_rd_gray_sync1;
+(* ASYNC_REG = "TRUE" *) reg [RX_ADDR_BITS:0] rx_data_rd_gray_sync2;
+reg [RX_DESC_BITS:0] rx_desc_wr_bin, rx_desc_wr_gray;
+reg [RX_DESC_BITS:0] rx_desc_rd_bin, rx_desc_rd_gray;
+(* ASYNC_REG = "TRUE" *) reg [RX_DESC_BITS:0] rx_desc_rd_gray_sync1;
+(* ASYNC_REG = "TRUE" *) reg [RX_DESC_BITS:0] rx_desc_rd_gray_sync2;
+(* ASYNC_REG = "TRUE" *) reg [RX_DESC_BITS:0] rx_desc_wr_gray_sync1;
+(* ASYNC_REG = "TRUE" *) reg [RX_DESC_BITS:0] rx_desc_wr_gray_sync2;
+reg [RX_ADDR_BITS-1:0] rx_desc_start [0:RX_DESC_DEPTH-1];
+reg [14:0] rx_desc_length [0:RX_DESC_DEPTH-1];
+reg [RX_ADDR_BITS:0] rx_desc_words [0:RX_DESC_DEPTH-1];
+reg [31:0] rx_desc_status3 [0:RX_DESC_DEPTH-1];
+reg [47:0] rx_desc_destination [0:RX_DESC_DEPTH-1];
+reg rx_desc_multicast [0:RX_DESC_DEPTH-1];
 (* ASYNC_REG = "TRUE" *) reg [1:0] rx_enable_sync;
 (* ASYNC_REG = "TRUE" *) reg [47:0] station_mac_meta, station_mac_sync;
 (* ASYNC_REG = "TRUE" *) reg [1:0] rx_promiscuous_sync;
@@ -439,9 +614,23 @@ wire [13:0] rx_frame_length14 = (rx_wire_count >= 4) ?
 wire [31:0] rx_word_with_byte =
     (rx_word_accum & ~(32'hff << (rx_byte_lane*8))) |
     ({24'd0, gmii_rxd} << (rx_byte_lane*8));
+wire [RX_DESC_BITS:0] rx_desc_rd_bin_gmii =
+    rx_desc_gray_to_binary(rx_desc_rd_gray_sync2);
+wire rx_desc_full =
+    (rx_desc_wr_bin - rx_desc_rd_bin_gmii) == RX_DESC_DEPTH;
+wire [RX_ADDR_BITS:0] rx_data_rd_bin_gmii =
+    rx_gray_to_binary(rx_data_rd_gray_sync2);
+wire [RX_ADDR_BITS:0] rx_data_used_words =
+    rx_data_wr_bin - rx_data_rd_bin_gmii;
+wire [RX_ADDR_BITS:0] rx_data_free_words = RX_WORDS - rx_data_used_words;
+wire rx_queue_has_room = !rx_desc_full &&
+                         rx_data_free_words >= RX_MAX_WIRE_WORDS;
 
 always @(posedge gtx_clk) begin
-    rx_ack_sync <= {rx_ack_sync[0], rx_ack_toggle_axis};
+    rx_desc_rd_gray_sync1 <= rx_desc_rd_gray;
+    rx_desc_rd_gray_sync2 <= rx_desc_rd_gray_sync1;
+    rx_data_rd_gray_sync1 <= rx_data_rd_gray;
+    rx_data_rd_gray_sync2 <= rx_data_rd_gray_sync1;
     rx_enable_sync <= {rx_enable_sync[0], reg_rcw1[28]};
     station_mac_meta <= {reg_uaw1[15:0], reg_uaw0};
     station_mac_sync <= station_mac_meta;
@@ -450,8 +639,11 @@ always @(posedge gtx_clk) begin
         rx_state <= RX_SEARCH; rx_preamble_count <= 0; rx_wire_count <= 0;
         rx_byte_lane <= 0; rx_word_accum <= 0; rx_destination <= 0;
         rx_accepted <= 0; rx_error_seen <= 0; rx_crc <= 32'hffffffff;
-        rx_length_gmii <= 0;
-        rx_done_toggle <= 0; rx_ack_sync <= 0;
+        rx_store_frame <= 0; rx_frame_start_word <= 0;
+        rx_data_wr_bin <= 0; rx_data_rd_gray_sync1 <= 0;
+        rx_data_rd_gray_sync2 <= 0;
+        rx_desc_wr_bin <= 0; rx_desc_wr_gray <= 0;
+        rx_desc_rd_gray_sync1 <= 0; rx_desc_rd_gray_sync2 <= 0;
         rx_enable_sync <= 0; rx_byte_count <= 0; rx_frame_count <= 0;
         station_mac_meta <= 0; station_mac_sync <= 0;
         rx_promiscuous_sync <= 0;
@@ -468,23 +660,28 @@ always @(posedge gtx_clk) begin
               else if (gmii_rxd == 8'h55 && rx_preamble_count < 7)
                   rx_preamble_count <= rx_preamble_count + 1'b1;
               else if (gmii_rxd == 8'hd5 && rx_preamble_count >= 1 &&
-                       rx_enable_sync[1] && rx_ack_sync[1] == rx_done_toggle) begin
+                       rx_enable_sync[1]) begin
                   rx_state <= RX_FRAME; rx_wire_count <= 0; rx_byte_lane <= 0;
                   rx_word_accum <= 0; rx_destination <= 0; rx_accepted <= 0;
                   rx_error_seen <= 0; rx_crc <= 32'hffffffff;
+                  rx_store_frame <= rx_queue_has_room;
+                  rx_frame_start_word <= rx_data_wr_bin[RX_ADDR_BITS-1:0];
               end else if (gmii_rxd != 8'h55) rx_state <= RX_SEARCH;
           end
           RX_FRAME: begin
               if (gmii_rx_dv) begin
                   rx_error_seen <= rx_error_seen | gmii_rx_er;
                   rx_crc <= crc32_byte(rx_crc, gmii_rxd);
-                  if (rx_wire_count < RX_BYTES) begin
+                  if (rx_store_frame &&
+                      rx_wire_count < RX_MAX_DMA_BYTES + 4) begin
                       rx_word_accum <= rx_word_with_byte;
                       if (rx_byte_lane == 3) begin
-                          rx_mem[rx_wire_count[13:2]] <= rx_word_with_byte;
+                          rx_mem[rx_frame_start_word +
+                                 rx_wire_count[RX_ADDR_BITS+1:2]] <=
+                              rx_word_with_byte;
                           rx_byte_lane <= 0; rx_word_accum <= 0;
                       end else rx_byte_lane <= rx_byte_lane + 1'b1;
-                  end else rx_error_seen <= 1;
+                  end
                   if (rx_wire_count < 6)
                       rx_destination <= {gmii_rxd, rx_destination[47:8]};
                   if (rx_wire_count == 5) begin
@@ -500,18 +697,37 @@ always @(posedge gtx_clk) begin
                       rx_crc == CRC_RESIDUE &&
                       rx_wire_count >= RX_MIN_WIRE_BYTES &&
                       rx_wire_count <= RX_MAX_DMA_BYTES + 4) begin
-                      rx_length_gmii <= rx_wire_count - 4;
-                      rx_status_word3 <= {
-                          1'b0, 1'b0, 1'b0, 1'b0, 1'b0,
-                          1'b0, 1'b0,
-                          rx_frame_length14,
-                          rx_is_multicast, rx_is_broadcast,
-                          1'b0, 1'b0, 1'b1, 6'b0};
-                      rx_done_toggle <= ~rx_done_toggle;
-                      rx_byte_count <= rx_byte_count + rx_wire_count - 4;
-                      rx_frame_count <= rx_frame_count + 1'b1;
-                      if (rx_is_broadcast) rx_broadcast_count <= rx_broadcast_count + 1'b1;
-                      if (rx_is_multicast) rx_multicast_count <= rx_multicast_count + 1'b1;
+                      if (rx_store_frame) begin
+                          rx_desc_start[rx_desc_wr_bin[RX_DESC_BITS-1:0]] <=
+                              rx_frame_start_word;
+                          rx_desc_length[rx_desc_wr_bin[RX_DESC_BITS-1:0]] <=
+                              rx_wire_count - 4;
+                          rx_desc_words[rx_desc_wr_bin[RX_DESC_BITS-1:0]] <=
+                              (rx_wire_count + 3) >> 2;
+                          rx_desc_status3[rx_desc_wr_bin[RX_DESC_BITS-1:0]] <= {
+                              1'b0, 1'b0, 1'b0, 1'b0, 1'b0,
+                              1'b0, 1'b0,
+                              rx_frame_length14,
+                              rx_is_multicast, rx_is_broadcast,
+                              1'b0, 1'b0, 1'b1, 6'b0};
+                          rx_desc_destination[rx_desc_wr_bin[RX_DESC_BITS-1:0]] <=
+                              rx_destination;
+                          rx_desc_multicast[rx_desc_wr_bin[RX_DESC_BITS-1:0]] <=
+                              rx_is_multicast;
+                          rx_data_wr_bin <= rx_data_wr_bin +
+                              ((rx_wire_count + 3) >> 2);
+                          rx_desc_wr_bin <= rx_desc_wr_bin + 1'b1;
+                          rx_desc_wr_gray <= ((rx_desc_wr_bin + 1'b1) >> 1) ^
+                                             (rx_desc_wr_bin + 1'b1);
+                          rx_byte_count <= rx_byte_count + rx_wire_count - 4;
+                          rx_frame_count <= rx_frame_count + 1'b1;
+                          if (rx_is_broadcast)
+                              rx_broadcast_count <= rx_broadcast_count + 1'b1;
+                          if (rx_is_multicast)
+                              rx_multicast_count <= rx_multicast_count + 1'b1;
+                      end else begin
+                          rx_overflow_count <= rx_overflow_count + 1'b1;
+                      end
                   end else if (!rx_accepted) begin
                       rx_filter_drop_count <= rx_filter_drop_count + 1'b1;
                   end else if (rx_error_seen || rx_crc != CRC_RESIDUE ||
@@ -528,14 +744,16 @@ always @(posedge gtx_clk) begin
 end
 
 // RX AXI-stream readout starts only after the complete frame passed every
-// receive check in the GMII domain.
-(* ASYNC_REG = "TRUE" *) reg [1:0] rx_done_sync;
-reg rx_done_seen, rx_axis_active, rx_status_active;
+// receive check in the GMII domain. Data and status may drain independently;
+// the circular data allocation is reclaimed after both streams finish.
+reg rx_axis_active, rx_status_active;
 reg rx_data_complete, rx_status_complete;
 reg [14:0] rx_length_axis;
 reg [31:0] rx_status3_axis;
 reg [47:0] rx_destination_axis;
 reg rx_multicast_axis;
+reg [RX_ADDR_BITS-1:0] rx_start_axis;
+reg [RX_ADDR_BITS:0] rx_words_axis;
 reg [12:0] rx_word_index;
 reg [2:0] rx_status_index;
 wire [12:0] rx_available_words = (rx_length_axis + 3) >> 2;
@@ -543,23 +761,37 @@ wire [12:0] rx_last_word = (rx_length_axis == 0) ? 0 : ((rx_length_axis - 1) >> 
 assign m_axis_rxs_tkeep = 4'hf;
 
 always @(posedge axis_clk) begin
-    rx_done_sync <= {rx_done_sync[0], rx_done_toggle};
+    rx_desc_wr_gray_sync1 <= rx_desc_wr_gray;
+    rx_desc_wr_gray_sync2 <= rx_desc_wr_gray_sync1;
     if (!axi_rxd_arstn || !axi_rxs_arstn) begin
-        rx_done_sync <= 0; rx_done_seen <= 0;
-        rx_axis_active <= 0; rx_status_active <= 0; rx_ack_toggle_axis <= 0;
+        rx_desc_wr_gray_sync1 <= 0; rx_desc_wr_gray_sync2 <= 0;
+        rx_desc_rd_bin <= 0; rx_desc_rd_gray <= 0;
+        rx_data_rd_bin <= 0; rx_data_rd_gray <= 0;
+        rx_axis_active <= 0; rx_status_active <= 0;
         rx_data_complete <= 0; rx_status_complete <= 0;
         rx_word_index <= 0; rx_status_index <= 0; m_axis_rxd_tvalid <= 0;
         m_axis_rxd_tlast <= 0; m_axis_rxd_tdata <= 0; m_axis_rxd_tkeep <= 0;
         m_axis_rxs_tvalid <= 0; m_axis_rxs_tlast <= 0; m_axis_rxs_tdata <= 0;
         rx_length_axis <= 0; rx_status3_axis <= 0; rx_destination_axis <= 0;
-        rx_multicast_axis <= 0;
+        rx_multicast_axis <= 0; rx_start_axis <= 0; rx_words_axis <= 0;
     end else begin
-        if (rx_done_sync[1] != rx_done_seen) begin
-            rx_done_seen <= rx_done_sync[1]; rx_axis_active <= 1;
+        if (!rx_axis_active && !rx_status_active &&
+            !rx_data_complete && !rx_status_complete &&
+            rx_desc_rd_gray != rx_desc_wr_gray_sync2) begin
+            rx_axis_active <= 1;
             rx_status_active <= 1; rx_word_index <= 0; rx_status_index <= 0;
-            rx_data_complete <= 0; rx_status_complete <= 0;
-            rx_length_axis <= rx_length_gmii; rx_status3_axis <= rx_status_word3;
-            rx_destination_axis <= rx_destination; rx_multicast_axis <= rx_is_multicast;
+            rx_length_axis <= rx_desc_length[
+                rx_desc_rd_bin[RX_DESC_BITS-1:0]];
+            rx_status3_axis <= rx_desc_status3[
+                rx_desc_rd_bin[RX_DESC_BITS-1:0]];
+            rx_destination_axis <= rx_desc_destination[
+                rx_desc_rd_bin[RX_DESC_BITS-1:0]];
+            rx_multicast_axis <= rx_desc_multicast[
+                rx_desc_rd_bin[RX_DESC_BITS-1:0]];
+            rx_start_axis <= rx_desc_start[
+                rx_desc_rd_bin[RX_DESC_BITS-1:0]];
+            rx_words_axis <= rx_desc_words[
+                rx_desc_rd_bin[RX_DESC_BITS-1:0]];
         end
 
         if (m_axis_rxs_tvalid && m_axis_rxs_tready) begin
@@ -590,14 +822,21 @@ always @(posedge axis_clk) begin
             end else rx_word_index <= rx_word_index + 1'b1;
         end
         if (!m_axis_rxd_tvalid && rx_axis_active && rx_word_index < rx_available_words) begin
-            m_axis_rxd_tdata <= rx_mem[rx_word_index]; m_axis_rxd_tvalid <= 1;
+            m_axis_rxd_tdata <= rx_mem[rx_start_axis +
+                rx_word_index[RX_ADDR_BITS-1:0]];
+            m_axis_rxd_tvalid <= 1;
             m_axis_rxd_tlast <= (rx_word_index == rx_last_word);
             if (rx_word_index == rx_last_word && rx_length_axis[1:0] != 0)
                 m_axis_rxd_tkeep <= (4'b0001 << rx_length_axis[1:0]) - 1'b1;
             else m_axis_rxd_tkeep <= 4'hf;
         end
         if (rx_data_complete && rx_status_complete) begin
-            rx_ack_toggle_axis <= rx_done_seen;
+            rx_data_rd_bin <= rx_data_rd_bin + rx_words_axis;
+            rx_data_rd_gray <= ((rx_data_rd_bin + rx_words_axis) >> 1) ^
+                                (rx_data_rd_bin + rx_words_axis);
+            rx_desc_rd_bin <= rx_desc_rd_bin + 1'b1;
+            rx_desc_rd_gray <= ((rx_desc_rd_bin + 1'b1) >> 1) ^
+                               (rx_desc_rd_bin + 1'b1);
             rx_data_complete <= 0; rx_status_complete <= 0;
         end
     end

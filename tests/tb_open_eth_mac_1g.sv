@@ -5,6 +5,7 @@ reg axis_clk=0, gtx_clk=0;
 always #3.333 axis_clk = ~axis_clk;
 always #4 gtx_clk = ~gtx_clk;
 reg resetn=0;
+reg mac_clk_en=1;
 reg [31:0] txd_data=0, txc_data=0;
 reg [3:0] txd_keep=0, txc_keep=4'hf;
 reg txd_last=0, txd_valid=0, txc_last=0, txc_valid=0;
@@ -21,7 +22,7 @@ reg [7:0] gmii_rxd=0; reg gmii_rx_dv=0, gmii_rx_er=0;
 wire [7:0] gmii_txd; wire gmii_tx_en,gmii_tx_er,interrupt,mac_irq;
 
 open_eth_mac_1g dut (
- .axis_clk(axis_clk),.s_axi_lite_clk(axis_clk),.gtx_clk(gtx_clk),.clk_en(1'b1),
+ .axis_clk(axis_clk),.s_axi_lite_clk(axis_clk),.gtx_clk(gtx_clk),.clk_en(mac_clk_en),
  .axi_txd_arstn(resetn),.axi_txc_arstn(resetn),.axi_rxd_arstn(resetn),
  .axi_rxs_arstn(resetn),.s_axi_lite_resetn(resetn),
  .s_axis_txd_tdata(txd_data),.s_axis_txd_tkeep(txd_keep),.s_axis_txd_tlast(txd_last),
@@ -41,9 +42,12 @@ open_eth_mac_1g dut (
  .gmii_txd(gmii_txd),.gmii_tx_en(gmii_tx_en),.gmii_tx_er(gmii_tx_er),
  .interrupt(interrupt),.mac_irq(mac_irq));
 
-integer errors=0, i, tx_cap_count=0, rx_cap_count=0, status_count=0;
+integer errors=0, i, j, tx_cap_count=0, rx_cap_count=0, status_count=0;
 reg [7:0] tx_capture[0:5000], rx_capture[0:20000];
-reg [31:0] status_capture[0:5];
+reg [31:0] status_capture[0:95];
+integer tx_frame_bytes=0, tx_completed_frames=0;
+integer tx_frame_offset[0:31], tx_frame_size[0:31];
+reg [31:0] axi_value;
 reg rx_store_forward_violation=0;
 reg tx_frame_active=0;
 reg [31:0] tx_check_crc;
@@ -55,11 +59,17 @@ endfunction
 
 always @(posedge gtx_clk) begin
  if (gmii_tx_en) begin
+  if (!tx_frame_active) begin
+   tx_frame_offset[tx_completed_frames]=tx_cap_count;
+   tx_frame_bytes=0;
+  end
   tx_frame_active=1;
   tx_capture[tx_cap_count]=gmii_txd; tx_cap_count=tx_cap_count+1;
+  tx_frame_bytes=tx_frame_bytes+1;
   if (gmii_tx_er) begin $display("ERROR: TX_ER asserted"); errors=errors+1; end
  end else if (tx_frame_active) begin
-  if (tx_cap_count!=72) begin $display("ERROR: GMII bubble at byte %0d",tx_cap_count); errors=errors+1; end
+  tx_frame_size[tx_completed_frames]=tx_frame_bytes;
+  tx_completed_frames=tx_completed_frames+1;
   tx_frame_active=0;
  end
 end
@@ -71,7 +81,7 @@ always @(posedge axis_clk) begin
    if (gmii_rx_dv) rx_store_forward_violation=1;
  end
  if (rxs_valid && rxs_ready) begin
-   if(status_count<6) status_capture[status_count]=rxs_data;
+   if(status_count<96) status_capture[status_count]=rxs_data;
    status_count=status_count+1;
    if (gmii_rx_dv) rx_store_forward_violation=1;
  end
@@ -86,6 +96,17 @@ task automatic axi_write(input [17:0] addr,input [31:0] value);
  end
 endtask
 
+task automatic axi_read(input [17:0] addr, output [31:0] value);
+ begin
+  @(posedge axis_clk); araddr<=addr; arvalid<=1;
+  while(!(arready&&arvalid)) @(posedge axis_clk);
+  arvalid<=0;
+  while(!rvalid) @(posedge axis_clk);
+  value=rdata;
+  @(posedge axis_clk);
+ end
+endtask
+
 task automatic send_control;
  begin
   for(i=0;i<6;i=i+1) begin
@@ -96,19 +117,34 @@ task automatic send_control;
  end
 endtask
 
-task automatic send_tx_frame(input integer length);
+task automatic send_tx_frame(input integer length, input integer base);
  integer p,n,lane; reg [31:0] word; reg [3:0] keep;
  begin
   send_control(); p=0;
   while(p<length) begin
    word=0; keep=0;
-   for(lane=0;lane<4;lane=lane+1) if(p+lane<length) begin word[lane*8 +: 8]=(p+lane); keep[lane]=1; end
+   for(lane=0;lane<4;lane=lane+1) if(p+lane<length) begin word[lane*8 +: 8]=(base+p+lane); keep[lane]=1; end
    @(posedge axis_clk); txd_data<=word; txd_keep<=keep; txd_last<=(p+4>=length); txd_valid<=1;
    while(!txd_ready) @(posedge axis_clk);
    if (gmii_tx_en) begin $display("ERROR: GMII started before TX TLAST"); errors=errors+1; end
    p=p+4;
   end
   @(posedge axis_clk); txd_valid<=0; txd_last<=0; txd_keep<=0;
+ end
+endtask
+
+task automatic wait_tx_frames(input integer expected);
+ integer timeout;
+ begin
+  timeout=0;
+  while(tx_completed_frames<expected && timeout<100000) begin
+   @(posedge gtx_clk); timeout=timeout+1;
+  end
+  if(timeout>=100000) begin
+   $display("ERROR: TX timeout frames=%0d expected=%0d desc=%0d/%0d",
+    tx_completed_frames,expected,dut.tx_desc_wr_bin,dut.tx_desc_rd_bin);
+   errors=errors+1;
+  end
  end
 endtask
 
@@ -170,10 +206,28 @@ task automatic wait_rx(input integer expected);
  begin
   timeout=0; while((rx_cap_count<expected || status_count<6) && timeout<10000) begin @(posedge axis_clk); timeout=timeout+1; end
   if(timeout>=10000) begin
-   $display("ERROR: RX timeout data=%0d status=%0d state=%0d done=%0b/%0b ack=%0b/%0b active=%0b len=%0d",
+   $display("ERROR: RX timeout data=%0d status=%0d state=%0d desc=%0d/%0d active=%0b len=%0d",
     rx_cap_count,status_count,dut.rx_state,
-    dut.rx_done_toggle,dut.rx_done_seen,dut.rx_ack_toggle_axis,dut.rx_ack_sync[1],
-    dut.rx_axis_active,dut.rx_length_gmii);
+    dut.rx_desc_wr_bin,dut.rx_desc_rd_bin,
+    dut.rx_axis_active,dut.rx_length_axis);
+   errors=errors+1;
+  end
+ end
+endtask
+
+task automatic wait_rx_queued(input integer expected_data,
+                              input integer expected_status);
+ integer timeout;
+ begin
+  timeout=0;
+  while((rx_cap_count<expected_data || status_count<expected_status) &&
+        timeout<100000) begin
+   @(posedge axis_clk); timeout=timeout+1;
+  end
+  if(timeout>=100000) begin
+   $display("ERROR: queued RX timeout data=%0d/%0d status=%0d/%0d desc=%0d/%0d",
+    rx_cap_count,expected_data,status_count,expected_status,
+    dut.rx_desc_wr_bin,dut.rx_desc_rd_bin);
    errors=errors+1;
   end
  end
@@ -189,8 +243,9 @@ initial begin
  axi_write(18'h00700,32'h00000002); axi_write(18'h00704,32'h00000100);
  axi_write(18'h00408,32'h10000000); axi_write(18'h00404,32'h12000000);
 
- send_tx_frame(20);
- while(tx_cap_count<72) @(posedge gtx_clk);
+ send_tx_frame(20,0);
+ wait_tx_frames(1);
+ if(tx_frame_size[0]!=72) begin $display("ERROR: first TX wire length %0d",tx_frame_size[0]); errors=errors+1; end
  if(tx_capture[0]!==8'h55 || tx_capture[7]!==8'hd5) begin $display("ERROR: TX preamble"); errors=errors+1; end
  for(i=0;i<20;i=i+1) if(tx_capture[8+i]!==i[7:0]) begin $display("ERROR: TX byte %0d",i); errors=errors+1; end
  for(i=28;i<68;i=i+1) if(tx_capture[i]!==0) begin $display("ERROR: TX padding %0d",i); errors=errors+1; end
@@ -200,6 +255,36 @@ initial begin
  for(i=0;i<4;i=i+1) if(tx_capture[68+i]!==tx_check_crc[i*8 +: 8]) begin
    $display("ERROR: TX FCS byte %0d",i); errors=errors+1;
  end
+
+ // Fill every TX descriptor while GMII is paused. The old single-packet
+ // buffer would deassert TX ready after the first frame.
+ mac_clk_en=0; repeat(4) @(posedge gtx_clk);
+ for(j=0;j<8;j=j+1) send_tx_frame(400,8'h10+j);
+ repeat(2) @(posedge axis_clk);
+ if((dut.tx_desc_wr_bin-dut.tx_desc_rd_bin)!=8) begin
+   $display("ERROR: TX ring did not queue eight packets (%0d/%0d)",
+    dut.tx_desc_wr_bin,dut.tx_desc_rd_bin); errors=errors+1;
+ end
+ mac_clk_en=1; wait_tx_frames(9);
+ for(j=0;j<8;j=j+1) begin
+   if(tx_frame_size[j+1]!=412) begin
+    $display("ERROR: queued TX frame %0d wire length %0d",j,tx_frame_size[j+1]); errors=errors+1;
+   end
+   for(i=0;i<400;i=i+1)
+    if(tx_capture[tx_frame_offset[j+1]+8+i]!==((8'h10+j+i)&8'hff)) begin
+     $display("ERROR: queued TX frame %0d byte %0d",j,i); errors=errors+1;
+    end
+ end
+ // Queue another batch beyond the physical end of the 4 KiB BRAM to prove
+ // that both writer and reader wrap rather than treating it as one slot.
+ mac_clk_en=0; repeat(4) @(posedge gtx_clk);
+ for(j=0;j<3;j=j+1) send_tx_frame(400,8'h40+j);
+ mac_clk_en=1; wait_tx_frames(12);
+ for(j=0;j<3;j=j+1)
+   for(i=0;i<400;i=i+1)
+    if(tx_capture[tx_frame_offset[j+9]+8+i]!==((8'h40+j+i)&8'hff)) begin
+     $display("ERROR: wrapped TX frame %0d byte %0d",j,i); errors=errors+1;
+    end
 
  clear_rx_capture();
  send_rx_frame(48'h020000000001,60); wait_rx(60);
@@ -226,6 +311,61 @@ initial begin
  if(rx_store_forward_violation) begin $display("ERROR: maximum RX frame streamed before GMII completion"); errors=errors+1; end
  clear_rx_capture(); send_rx_frame(48'h020000000001,1519); repeat(200) @(posedge axis_clk);
  if(rx_cap_count!=0 || status_count!=0) begin $display("ERROR: oversized frame forwarded"); errors=errors+1; end
+
+ // Hold both AXI receive channels off while several valid frames arrive.
+ // Releasing them must drain every descriptor in arrival order.
+ clear_rx_capture(); @(negedge axis_clk); rxd_ready=0; rxs_ready=0;
+ send_rx_frame(48'h020000000001,60);
+ send_rx_frame(48'h020000000001,64);
+ send_rx_frame(48'h020000000001,68);
+ repeat(20) @(posedge axis_clk);
+ if(rx_cap_count!=0 || status_count!=0 ||
+    (dut.rx_desc_wr_bin-dut.rx_desc_rd_bin)!=3) begin
+   $display("ERROR: RX ring did not retain three stalled packets"); errors=errors+1;
+ end
+ @(negedge axis_clk); rxd_ready=1; rxs_ready=1; wait_rx_queued(192,18);
+ for(i=0;i<60;i=i+1) if(rx_capture[i]!==frame[i]) begin $display("ERROR: queued RX0 byte %0d",i); errors=errors+1; end
+ for(i=0;i<64;i=i+1) if(rx_capture[60+i]!==frame[i]) begin $display("ERROR: queued RX1 byte %0d",i); errors=errors+1; end
+ for(i=0;i<68;i=i+1) if(rx_capture[124+i]!==frame[i]) begin $display("ERROR: queued RX2 byte %0d",i); errors=errors+1; end
+ if(status_capture[5][13:0]!=60 || status_capture[11][13:0]!=64 ||
+    status_capture[17][13:0]!=68) begin
+   $display("ERROR: queued RX status lengths"); errors=errors+1;
+ end
+
+ // Ten maximum frames consume 3810 words and cross the physical end of the
+ // RX BRAM from the current write position. An eleventh frame must be counted
+ // as overflow while the AXI consumer remains stalled.
+ clear_rx_capture(); @(negedge axis_clk); rxd_ready=0; rxs_ready=0;
+ for(j=0;j<11;j=j+1) send_rx_frame(48'h020000000001,1518);
+ @(negedge axis_clk); rxd_ready=1; rxs_ready=1; wait_rx_queued(15180,60);
+ for(j=0;j<10;j=j+1) begin
+   if(status_capture[j*6+5][13:0]!=1518) begin
+    $display("ERROR: wrapped RX frame %0d status length",j); errors=errors+1;
+   end
+   for(i=0;i<1518;i=i+1)
+    if(rx_capture[j*1518+i]!==frame[i]) begin
+     $display("ERROR: wrapped RX frame %0d byte %0d",j,i); errors=errors+1;
+    end
+ end
+
+ axi_read(18'h00208,axi_value);
+ if(axi_value!==4460) begin $display("ERROR: snapshot TX bytes %0d",axi_value); errors=errors+1; end
+ axi_read(18'h002d8,axi_value);
+ if(axi_value!==12) begin $display("ERROR: snapshot TX frames %0d",axi_value); errors=errors+1; end
+ axi_read(18'h00200,axi_value);
+ if(axi_value!==17070) begin $display("ERROR: snapshot RX bytes %0d",axi_value); errors=errors+1; end
+ axi_read(18'h00290,axi_value);
+ if(axi_value!==17) begin $display("ERROR: snapshot RX frames %0d",axi_value); errors=errors+1; end
+ axi_read(18'h00298,axi_value);
+ if(axi_value!==3) begin $display("ERROR: snapshot RX errors %0d",axi_value); errors=errors+1; end
+ axi_read(18'h002a0,axi_value);
+ if(axi_value!==1) begin $display("ERROR: snapshot RX broadcasts %0d",axi_value); errors=errors+1; end
+ axi_read(18'h002a8,axi_value);
+ if(axi_value!==1) begin $display("ERROR: snapshot RX multicasts %0d",axi_value); errors=errors+1; end
+ axi_read(18'h3ff00,axi_value);
+ if(axi_value!==1) begin $display("ERROR: snapshot RX filter drops %0d",axi_value); errors=errors+1; end
+ axi_read(18'h3ff04,axi_value);
+ if(axi_value!==2) begin $display("ERROR: snapshot RX overflows %0d",axi_value); errors=errors+1; end
 
  if(errors==0) $display("PASS: AXI Ethernet replacement TX/RX/filter test");
  else $display("FAIL: %0d errors",errors);
