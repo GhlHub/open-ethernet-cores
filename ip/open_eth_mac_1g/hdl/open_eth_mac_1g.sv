@@ -320,6 +320,7 @@ reg [TX_DESC_BITS:0] tx_desc_rd_bin, tx_desc_rd_gray;
 (* ASYNC_REG = "TRUE" *) reg [TX_DESC_BITS:0] tx_desc_wr_gray_sync2;
 reg [TX_ADDR_BITS-1:0] tx_desc_start [0:TX_DESC_DEPTH-1];
 reg [12:0] tx_desc_length [0:TX_DESC_DEPTH-1];
+reg [TX_ADDR_BITS:0] tx_desc_words [0:TX_DESC_DEPTH-1];
 reg [TX_ADDR_BITS:0] tx_frame_words;
 wire [2:0] tx_valid_bytes = s_axis_txd_tkeep[0] + s_axis_txd_tkeep[1] +
                              s_axis_txd_tkeep[2] + s_axis_txd_tkeep[3];
@@ -381,6 +382,13 @@ always @(posedge axis_clk) begin
                         tx_data_wr_bin[TX_ADDR_BITS-1:0];
                     tx_desc_length[tx_desc_wr_bin[TX_DESC_BITS-1:0]] <=
                         tx_wr_count + tx_valid_bytes;
+                    // AXI DMA can place a partial TKEEP beat at an interior
+                    // scatter-gather descriptor boundary. The number of
+                    // occupied packet-buffer words can therefore exceed
+                    // ceil(frame byte length / 4). Preserve the exact count
+                    // so the GMII side releases every accepted storage word.
+                    tx_desc_words[tx_desc_wr_bin[TX_DESC_BITS-1:0]] <=
+                        tx_frame_words + 1'b1;
                     tx_data_wr_bin <= tx_data_work_bin + 1'b1;
                     tx_desc_wr_bin <= tx_desc_wr_bin + 1'b1;
                     tx_desc_wr_gray <= ((tx_desc_wr_bin + 1'b1) >> 1) ^
@@ -405,6 +413,7 @@ reg [9:0] tx_rd_addr;
 reg [TX_ADDR_BITS-1:0] tx_start_gmii;
 reg [1:0] tx_rd_lane;
 reg [12:0] tx_length_gmii, tx_data_sent;
+reg [TX_ADDR_BITS:0] tx_words_gmii;
 wire [31:0] tx_mem_q;
 wire [7:0] tx_mem_byte = tx_mem_q[tx_rd_lane*8 +: 8];
 reg [31:0] tx_crc, tx_fcs;
@@ -453,7 +462,8 @@ always @(posedge gtx_clk) begin
     if (!gtx_tx_resetn) begin
         tx_state <= TX_IDLE; gmii_txd <= 0; gmii_tx_en <= 0; gmii_tx_er <= 0;
         tx_phase <= 0; tx_rd_addr <= 0; tx_start_gmii <= 0;
-        tx_rd_lane <= 0; tx_data_sent <= 0; tx_crc <= 32'hffffffff;
+        tx_rd_lane <= 0; tx_data_sent <= 0; tx_words_gmii <= 0;
+        tx_crc <= 32'hffffffff;
         tx_desc_wr_gray_sync1 <= 0; tx_desc_wr_gray_sync2 <= 0;
         tx_desc_rd_bin <= 0; tx_desc_rd_gray <= 0;
         tx_data_rd_bin <= 0; tx_data_rd_gray <= 0; tx_enable_sync <= 0;
@@ -468,6 +478,8 @@ always @(posedge gtx_clk) begin
                       tx_desc_rd_bin[TX_DESC_BITS-1:0]];
                   tx_length_gmii <= tx_desc_length[
                       tx_desc_rd_bin[TX_DESC_BITS-1:0]];
+                  tx_words_gmii <= tx_desc_words[
+                      tx_desc_rd_bin[TX_DESC_BITS-1:0]];
                   tx_state <= TX_LAUNCH;
               end
           end
@@ -479,10 +491,10 @@ always @(posedge gtx_clk) begin
               end else tx_state <= TX_DISCARD;
           end
           TX_DISCARD: begin
-              tx_data_rd_bin <= tx_data_rd_bin + ((tx_length_gmii + 3) >> 2);
+              tx_data_rd_bin <= tx_data_rd_bin + tx_words_gmii;
               tx_data_rd_gray <= ((tx_data_rd_bin +
-                  ((tx_length_gmii + 3) >> 2)) >> 1) ^
-                  (tx_data_rd_bin + ((tx_length_gmii + 3) >> 2));
+                  tx_words_gmii) >> 1) ^
+                  (tx_data_rd_bin + tx_words_gmii);
               tx_desc_rd_bin <= tx_desc_rd_bin + 1'b1;
               tx_desc_rd_gray <= ((tx_desc_rd_bin + 1'b1) >> 1) ^
                                  (tx_desc_rd_bin + 1'b1);
@@ -523,10 +535,10 @@ always @(posedge gtx_clk) begin
           TX_FCS3: begin
               gmii_txd <= tx_fcs[31:24]; tx_state <= TX_IFG; tx_phase <= 0;
               tx_frame_count <= tx_frame_count + 1'b1;
-              tx_data_rd_bin <= tx_data_rd_bin + ((tx_length_gmii + 3) >> 2);
+              tx_data_rd_bin <= tx_data_rd_bin + tx_words_gmii;
               tx_data_rd_gray <= ((tx_data_rd_bin +
-                  ((tx_length_gmii + 3) >> 2)) >> 1) ^
-                  (tx_data_rd_bin + ((tx_length_gmii + 3) >> 2));
+                  tx_words_gmii) >> 1) ^
+                  (tx_data_rd_bin + tx_words_gmii);
               tx_desc_rd_bin <= tx_desc_rd_bin + 1'b1;
               tx_desc_rd_gray <= ((tx_desc_rd_bin + 1'b1) >> 1) ^
                                  (tx_desc_rd_bin + 1'b1);

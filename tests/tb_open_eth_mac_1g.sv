@@ -133,6 +133,37 @@ task automatic send_tx_frame(input integer length, input integer base);
  end
 endtask
 
+// Model one logical frame split across two scatter-gather descriptors.  The
+// first descriptor ends on a partial AXI beat, but TLAST belongs only to the
+// second descriptor.  This is the shape that exposed TX buffer word leakage
+// on hardware (42-byte header plus 422-byte payload).
+task automatic send_tx_split_frame(input integer first_length,
+                                   input integer second_length,
+                                   input integer base);
+ integer segment,p,lane,segment_length,byte_offset;
+ reg [31:0] word;
+ reg [3:0] keep;
+ begin
+  send_control(); byte_offset=0;
+  for(segment=0;segment<2;segment=segment+1) begin
+   segment_length=(segment==0)?first_length:second_length; p=0;
+   while(p<segment_length) begin
+    word=0; keep=0;
+    for(lane=0;lane<4;lane=lane+1)
+     if(p+lane<segment_length) begin
+      word[lane*8 +: 8]=base+byte_offset+p+lane; keep[lane]=1;
+     end
+    @(posedge axis_clk); txd_data<=word; txd_keep<=keep;
+    txd_last<=(segment==1 && p+4>=segment_length); txd_valid<=1;
+    while(!txd_ready) @(posedge axis_clk);
+    p=p+4;
+   end
+   byte_offset=byte_offset+segment_length;
+  end
+  @(posedge axis_clk); txd_valid<=0; txd_last<=0; txd_keep<=0;
+ end
+endtask
+
 task automatic wait_tx_frames(input integer expected);
  integer timeout;
  begin
@@ -286,6 +317,18 @@ initial begin
      $display("ERROR: wrapped TX frame %0d byte %0d",j,i); errors=errors+1;
     end
 
+ // A partial non-final beat consumes an extra physical buffer word. The
+ // descriptor must release the exact accepted-beat count after transmission.
+ send_tx_split_frame(42,422,8'h70);
+ wait_tx_frames(13); repeat(8) @(posedge axis_clk);
+ if(dut.tx_data_wr_bin!==dut.tx_data_rd_bin) begin
+   $display("ERROR: split-frame TX buffer leak wr=%0d rd=%0d",
+    dut.tx_data_wr_bin,dut.tx_data_rd_bin); errors=errors+1;
+ end
+ if(tx_frame_size[12]!=476) begin
+   $display("ERROR: split-frame TX wire length %0d",tx_frame_size[12]); errors=errors+1;
+ end
+
  clear_rx_capture();
  send_rx_frame(48'h020000000001,60); wait_rx(60);
  if(rx_store_forward_violation) begin $display("ERROR: RX streamed before end of GMII frame"); errors=errors+1; end
@@ -349,9 +392,9 @@ initial begin
  end
 
  axi_read(18'h00208,axi_value);
- if(axi_value!==4460) begin $display("ERROR: snapshot TX bytes %0d",axi_value); errors=errors+1; end
+ if(axi_value!==4924) begin $display("ERROR: snapshot TX bytes %0d",axi_value); errors=errors+1; end
  axi_read(18'h002d8,axi_value);
- if(axi_value!==12) begin $display("ERROR: snapshot TX frames %0d",axi_value); errors=errors+1; end
+ if(axi_value!==13) begin $display("ERROR: snapshot TX frames %0d",axi_value); errors=errors+1; end
  axi_read(18'h00200,axi_value);
  if(axi_value!==17070) begin $display("ERROR: snapshot RX bytes %0d",axi_value); errors=errors+1; end
  axi_read(18'h00290,axi_value);
